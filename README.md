@@ -1,4 +1,4 @@
-# WireGuard Exit Router
+# Kamui Routing
 
 Linux routing controllers for directing downstream router
 traffic through a remote WireGuard Internet exit.
