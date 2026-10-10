@@ -1,0 +1,181 @@
+#!/bin/bash
+set -euo pipefail
+
+HARASHIN="10.240.145.5"
+OBITO="10.240.145.4"
+WG="wg-exit"
+TABLE="146"
+PRIORITY="110"
+FW="harashin_obito"
+
+die() {
+    echo "ERROR: $*" >&2
+    exit 1
+}
+
+check() {
+    ip link show "$WG" >/dev/null 2>&1 ||
+        die "WireGuard interface unavailable"
+
+    ip route get "$OBITO" | grep -q "dev $WG" ||
+        die "Obito is not reachable through wg-exit"
+
+    wg show "$WG" allowed-ips |
+        grep -q '10.240.145.5/32' ||
+        die "Harashin peer not found"
+}
+
+firewall_on() {
+    # Early kill switch. Drop Internet traffic that
+    # would otherwise escape via nagato's wan0.
+    nft delete table ip "$FW" 2>/dev/null || true
+    nft add table ip "$FW"
+
+    nft "add chain ip $FW guard { type filter hook forward priority -20; policy accept; }"
+
+    # Preserve existing local LAN access.
+    nft add rule ip "$FW" guard \
+        ip saddr "$HARASHIN" \
+        ip daddr 172.20.100.0/24 \
+        counter accept
+
+    nft add rule ip "$FW" guard \
+        ip saddr "$HARASHIN" \
+        ip daddr 10.240.0.0/30 \
+        counter accept
+
+    nft add rule ip "$FW" guard \
+        ip saddr "$HARASHIN" \
+        ip daddr 10.240.10.0/24 \
+        counter accept
+
+    # No public Internet fallback outside WireGuard.
+    nft add rule ip "$FW" guard \
+        iifname "$WG" ip saddr "$HARASHIN" \
+        oifname != "$WG" counter drop
+
+    # Existing FORWARD chain defaults to DROP.
+    # Explicitly permit wg-exit -> wg-exit forwarding.
+    if ! iptables-nft -C FORWARD \
+        -s "$HARASHIN/32" -i "$WG" -o "$WG" \
+        -j ACCEPT 2>/dev/null; then
+
+        iptables-nft -I FORWARD 1 \
+            -s "$HARASHIN/32" -i "$WG" -o "$WG" \
+            -j ACCEPT
+    fi
+
+    # NAT Harashin onto nagato's WG address.
+    nft "add chain ip $FW nat { type nat hook postrouting priority 90; policy accept; }"
+
+    nft add rule ip "$FW" nat \
+        ip saddr "$HARASHIN" oifname "$WG" \
+        counter masquerade
+}
+
+firewall_off() {
+    nft delete table ip "$FW" 2>/dev/null || true
+
+    while iptables-nft -C FORWARD \
+        -s "$HARASHIN/32" -i "$WG" -o "$WG" \
+        -j ACCEPT 2>/dev/null; do
+
+        iptables-nft -D FORWARD \
+            -s "$HARASHIN/32" -i "$WG" -o "$WG" \
+            -j ACCEPT
+    done
+}
+
+route_on() {
+    # Preserve existing routes to local networks.
+    ip route replace 10.240.145.0/29 dev "$WG" table "$TABLE"
+    ip route replace 10.240.0.0/30 dev lan0 table "$TABLE"
+    ip route replace 172.20.100.0/24 dev wan0 table "$TABLE"
+
+    # Route other traffic through obito.
+    ip route replace default dev "$WG" table "$TABLE"
+
+    if ! ip rule show | grep -q \
+        "from $HARASHIN lookup $TABLE"; then
+
+        ip rule add priority "$PRIORITY" \
+            from "$HARASHIN/32" table "$TABLE"
+    fi
+
+    ip route flush cache 2>/dev/null || true
+}
+
+route_off() {
+    while ip rule del priority "$PRIORITY" \
+        from "$HARASHIN/32" table "$TABLE" \
+        2>/dev/null; do
+        :
+    done
+
+    ip route flush table "$TABLE" 2>/dev/null || true
+    ip route flush cache 2>/dev/null || true
+}
+
+status() {
+    echo "=== HARASHIN / FLYING RAIJIN ==="
+    echo
+
+    echo "--- Policy routing ---"
+    ip rule show | grep "$HARASHIN" || echo "OFF"
+
+    echo
+    echo "--- Routing table 146 ---"
+    ip route show table "$TABLE" 2>/dev/null || true
+
+    echo
+    echo "--- Internet route ---"
+    ip route get 1.1.1.1 \
+        from "$HARASHIN" iif "$WG" || true
+
+    echo
+    echo "--- Forwarding rules ---"
+    iptables-nft -S FORWARD |
+        grep "$HARASHIN" || true
+
+    echo
+    echo "--- Firewall / NAT ---"
+    nft list table ip "$FW" 2>/dev/null ||
+        echo "OFF"
+
+    echo
+    echo "--- Obito WireGuard handshake ---"
+    wg show "$WG" latest-handshakes || true
+}
+
+case "${1:-status}" in
+    on)
+        [ "$(id -u)" -eq 0 ] || die "Use sudo"
+        check
+
+        # Install firewall first to avoid fallback
+        # during the routing transition.
+        firewall_on
+        route_on
+
+        echo "Harashin -> obito ENABLED"
+        status
+        ;;
+
+    off)
+        [ "$(id -u)" -eq 0 ] || die "Use sudo"
+
+        route_off
+        firewall_off
+
+        echo "Harashin -> obito DISABLED"
+        ;;
+
+    status)
+        status
+        ;;
+
+    *)
+        echo "Usage: harashin-obito {on|off|status}"
+        exit 2
+        ;;
+esac

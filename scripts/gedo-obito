@@ -1,0 +1,137 @@
+#!/bin/bash
+set -euo pipefail
+
+GEDO_IP="10.240.0.2"
+GEDO_IF="lan0"
+WG_IF="wg-exit"
+OBITO_WG="10.240.145.4"
+TABLE_ID="145"
+RULE_PRIO="100"
+
+die() {
+    echo "ERROR: $*" >&2
+    exit 1
+}
+
+wg_ok() {
+    ip link show "$WG_IF" >/dev/null 2>&1 || return 1
+    ip route get "$OBITO_WG" 2>/dev/null | grep -q "dev $WG_IF"
+}
+
+enable_forwarding() {
+    /usr/sbin/sysctl -w net.ipv4.ip_forward=1 >/dev/null
+}
+
+enable_route() {
+    ip route replace default dev "$WG_IF" table "$TABLE_ID"
+
+    if ! ip rule show | grep -q "from $GEDO_IP lookup $TABLE_ID"; then
+        ip rule add priority "$RULE_PRIO" from "$GEDO_IP/32" table "$TABLE_ID"
+    fi
+
+    ip route flush cache 2>/dev/null || true
+}
+
+disable_route() {
+    while ip rule del priority "$RULE_PRIO" from "$GEDO_IP/32" table "$TABLE_ID" 2>/dev/null; do
+        :
+    done
+
+    ip route flush table "$TABLE_ID" 2>/dev/null || true
+    ip route flush cache 2>/dev/null || true
+}
+
+add_firewall() {
+    nft delete table ip gedo_obito 2>/dev/null || true
+
+    nft add table ip gedo_obito
+
+    nft 'add chain ip gedo_obito forward { type filter hook forward priority -10; policy accept; }'
+    nft 'add chain ip gedo_obito postrouting { type nat hook postrouting priority srcnat; policy accept; }'
+
+    # Allow Gedo out through obito.
+    nft add rule ip gedo_obito forward \
+        iifname "$GEDO_IF" ip saddr "$GEDO_IP" \
+        oifname "$WG_IF" counter accept
+
+    # Allow replies.
+    nft add rule ip gedo_obito forward \
+        iifname "$WG_IF" oifname "$GEDO_IF" \
+        ip daddr "$GEDO_IP" \
+        ct state established,related counter accept
+
+    # Kill switch: Gedo cannot escape through wan0 or another interface.
+    nft add rule ip gedo_obito forward \
+        iifname "$GEDO_IF" ip saddr "$GEDO_IP" \
+        oifname != "$WG_IF" counter drop
+
+    # NAT Gedo onto nagato's WireGuard address.
+    nft add rule ip gedo_obito postrouting \
+        ip saddr "$GEDO_IP" oifname "$WG_IF" \
+        counter masquerade
+}
+
+remove_firewall() {
+    nft delete table ip gedo_obito 2>/dev/null || true
+}
+
+status() {
+    echo "=== GEDO OBITO STATUS ==="
+
+    echo
+    echo "--- Policy rule ---"
+    ip rule show | grep "$GEDO_IP" || echo "DISABLED"
+
+    echo
+    echo "--- Routing table 145 ---"
+    ip route show table "$TABLE_ID" || true
+
+    echo
+    echo "--- Simulated Gedo route ---"
+    ip route get 1.1.1.1 from "$GEDO_IP" iif "$GEDO_IF" 2>&1 || true
+
+    echo
+    echo "--- WireGuard ---"
+    wg show "$WG_IF"
+
+    echo
+    echo "--- Gedo firewall ---"
+    nft -a list table ip gedo_obito 2>/dev/null || echo "DISABLED"
+
+    echo
+    echo "--- IPv4 forwarding ---"
+    cat /proc/sys/net/ipv4/ip_forward
+}
+
+case "${1:-status}" in
+    on)
+        [ "$(id -u)" -eq 0 ] || die "Run with sudo."
+        wg_ok || die "$OBITO_WG is not routed through $WG_IF."
+
+        enable_forwarding
+        enable_route
+        add_firewall
+
+        echo "Gedo -> obito ENABLED."
+        echo
+        status
+        ;;
+
+    off)
+        [ "$(id -u)" -eq 0 ] || die "Run with sudo."
+
+        remove_firewall
+        disable_route
+
+        echo "Gedo -> obito DISABLED."
+        ;;
+
+    status)
+        status
+        ;;
+
+    *)
+        echo "Usage: gedo-obito {on|off|status}"
+        exit 2
+        ;;
+esac

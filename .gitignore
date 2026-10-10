@@ -1,0 +1,10 @@
+# Local configurations and secrets
+*.key
+*.conf
+*.private
+*.secret
+*.env
+.env
+*.log
+__pycache__/
+.DS_Store
