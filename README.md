@@ -7,6 +7,24 @@ operated Linux/WireGuard infrastructure. The addresses, networks, interface
 names, and node labels below describe an example. Supply your own topology and
 WireGuard configuration.
 
+## Origins and Development
+
+Kamui Routing emerged from an evolving multi-site networking
+environment initially focused on remote connectivity, VPN
+routing, and network-wide DNS filtering. The infrastructure
+gradually expanded to incorporate isolated test networks,
+remote gateways, and portable network devices, introducing
+increasingly complex routing requirements.
+
+Two distinct use cases ultimately shaped the project:
+selectively routing traffic from an Ethernet-connected
+downstream network through a remote exit, and forwarding
+traffic from a WireGuard-connected router back through the
+same tunnel interface toward an alternate exit. These
+requirements led to independent policy-routing controllers,
+subsequently extracted and generalized from the private
+infrastructure for public use.
+
 ## Architecture
 
 | Controller | Example path through the gateway | Source matched at the gateway | Policy table / priority |
